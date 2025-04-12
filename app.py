@@ -5,7 +5,7 @@ import os
 import time
 
 # Initialize LLM
-llm = ChatGroq(temperature=0.4, model_name="llama-3.3-70b-versatile")
+llm = ChatGroq(temperature=0.4, model_name="meta-llama/llama-4-maverick-17b-128e-instruct")
 
 # File to store history
 HISTORY_FILE = "history.txt"
