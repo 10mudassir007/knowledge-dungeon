@@ -1,51 +1,68 @@
-from langchain_groq import ChatGroq
+from langchain_groq import ChatGroq, GroqEmbeddings
 import streamlit as st
 from crewai import Agent
 import os
 import time
-
+import re
+from difflib import SequenceMatcher
+from sklearn.pairwise import cosine_similarity
 # Initialize LLM
-llm = ChatGroq(temperature=0.4, model_name="meta-llama/llama-4-maverick-17b-128e-instruct")
+llm = ChatGroq(temperature=0, model_name="meta-llama/llama-4-maverick-17b-128e-instruct")
 
-# File to store history
 HISTORY_FILE = "history.txt"
 
-# Load question history from file
 def load_history():
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r") as f:
             return [line.strip() for line in f.readlines()]
     return []
 
-# Save question history to file
 def save_history(history):
     with open(HISTORY_FILE, "w") as f:
         for question in history:
             f.write(question + "\n")
 
-# Initialize session state
+# Session State Initialization
 if "level" not in st.session_state:
     st.session_state.level = 1
     st.session_state.points = 0
-    st.session_state.history = load_history()  # Load history at startup
+    st.session_state.history = load_history()
     st.session_state.questions_answered = 0
     st.session_state.current_question = None
     st.session_state.hint = None
+    st.session_state.hint_used = False
     st.session_state.lives = 3
+    st.session_state.last_correct_answer = None
 
-# Define Agents
+# Agents
 class NarratorAgent(Agent):
     def act(self, level):
-        return llm.invoke(f"Generate a short(2-3 lines at most) welcome message for the user like a narrator according to level, the user is at level:{level}").content.strip()
+        return llm.invoke(
+            f"Generate a short(2-3 lines at most) welcome message for the user like a narrator according to level, the user is at level:{level}"
+        ).content.strip()
 
 class QuestionAgent(Agent):
     def act(self, level, history):
-        """Generate a unique question that is not in history"""
-        for _ in range(10):  # Try multiple times to get a unique question
+        for _ in range(10):
             question = llm.invoke(
                 f"Generate a general knowledge question for a Q and A game. The player is at level {level}. "
                 f"Avoid repeating questions from this list: {history}. "
                 f"Do not include MCQs, only a single general knowledge question."
+                f"Don't show any helper messages or descriptions such as 'Here is a question for level x ' etc ."
+            ).content.strip()
+            if question and question not in history:
+                return question
+        return "No new questions available. Try again later."
+        
+
+class QuestionAgent(Agent):
+    def act(self, level, history):
+        for _ in range(10):
+            question = llm.invoke(
+                f"Generate a general knowledge question suitable for 5th to 8th grade students. The player is at level {level}. "
+                f"Avoid repeating questions from this list: {history}. "
+                f"Do not include MCQs, only a single general knowledge question."
+                f"Don't show any helper messages or descriptions such as 'Here is a question for level x ' etc ."
             ).content.strip()
             if question and question not in history:
                 return question
@@ -57,7 +74,40 @@ class HintAgent(Agent):
 
 class AnswerCheckerAgent(Agent):
     def act(self, question, answer):
-        return llm.invoke(f"Check if the user's answer: '{answer}' is correct for the question: '{question}'. Only respond with 'yes' or 'no'.").content.lower().strip()
+        return llm.invoke(
+            f"Check if the user's answer: '{answer}' is correct for the question: '{question}'. Respond strictly with 'YES' or 'NO'."
+        ).content.lower().strip()
+
+    def reveal_answer(self, question):
+        return llm.invoke(f"What is the correct answer to the question: '{question}'? Respond with just the answer.").content.strip()
+
+
+class AnswerCheckerAgent(Agent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.embedder = GroqEmbeddings(model="nomic-embed-text-v1")
+
+    def act(self, question, user_answer):
+        correct = self.reveal_answer(question)
+        return self.is_semantically_correct(user_answer, correct), correct
+
+    def reveal_answer(self, question):
+        return llm.invoke(f"What is the correct answer to the question: '{question}'? Respond with just the answer.").content.strip()
+
+    def is_semantically_correct(self, user_answer, correct_answer):
+        def normalize(text):
+            return re.sub(r"[^\w\s]", "", text.lower())
+
+        user_clean = normalize(user_answer)
+        correct_clean = normalize(correct_answer)
+
+        # Embed both
+        user_embedding = self.embedder.embed_query(user_clean)
+        correct_embedding = self.embedder.embed_query(correct_clean)
+
+        # Cosine similarity
+        sim = cosine_similarity([user_embedding], [correct_embedding])[0][0]
+        return sim >= 0.80  # 80% similarity threshold
 
 # Instantiate agents
 narrator = NarratorAgent(role="Narrator", goal="Guide the story forward", backstory="Knows all details of the world and its characters.")
@@ -65,90 +115,93 @@ questioner = QuestionAgent(role="Questioner", goal="Generate a general knowledge
 hinter = HintAgent(role="Hinter", goal="Provide hints about the question", backstory="Knows the correct answer but gives limited hints.")
 validator = AnswerCheckerAgent(role="Validator", goal="Check if the answer is correct", backstory="Knows the correct answer.")
 
-# Streamlit App
+# UI Setup
 st.title("🏰 Knowledge Dungeon 🏰")
-
-# Sidebar for Level, Points & Lives Display
 st.sidebar.header("📜 Game Stats")
-st.sidebar.warning('Type "hint" to get hints from Gandalf ✨')
+
+# Hint Button
+if st.sidebar.button("💡 Get Hint"):
+    if not st.session_state.hint_used:
+        st.info(f"💡 Hint: {st.session_state.hint}")
+        st.session_state.hint_used = True
+    else:
+        st.sidebar.warning("You've already used the hint for this question.")
 
 st.sidebar.write(f"**🏆 Level:** {st.session_state.level}")
 st.sidebar.write(f"**💰 Points:** {st.session_state.points}")
 st.sidebar.write(f"**❤️ Lives:** {st.session_state.lives}")
 
+# Constants
 MAX_LEVEL = 10
 QUESTIONS_PER_LEVEL = 3
 POINTS_PER_CORRECT = 10
 
 def generate_new_question():
-    """Generates a unique new question and stores it in session state."""
     question = questioner.act(st.session_state.level, st.session_state.history)
-    
+
     if question != "No new questions available. Try again later.":
         st.session_state.current_question = question
         st.session_state.history.append(question)
         st.session_state.hint = hinter.act(st.session_state.level, question)
-        save_history(st.session_state.history)  # Save immediately to prevent duplicates
+        st.session_state.hint_used = False
+        save_history(st.session_state.history)
     else:
         st.session_state.current_question = "No more questions available!"
 
 def main():
     level = st.session_state.level
 
-    if level > MAX_LEVEL:
+    # Game completion logic
+    if level > MAX_LEVEL or (level == MAX_LEVEL and st.session_state.questions_answered >= QUESTIONS_PER_LEVEL):
         st.success("🎉 Congratulations! You have won the game! 🎉")
         st.stop()
-    
+
+    # Game over logic
     if st.session_state.lives <= 0:
         st.error("💀 You have lost all your lives! Game Over!")
-        st.write(f"Your score:{st.session_state.points}")
+        st.write(f"Your score: {st.session_state.points}")
+        if st.session_state.last_correct_answer:
+            st.info(f"📘 The correct answer was: **{st.session_state.last_correct_answer}**")
         if st.button("Retry"):
-            del st.session_state.level
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             st.rerun()
         st.stop()
-        
 
-    # Display Narration
+    # Narrator Line
     st.write(f"📜 Narrator: {narrator.act(level)}")
 
-    # Generate a new question if needed
+    # Ask a new question
     if not st.session_state.current_question:
         generate_new_question()
 
-    # Display the question
-    st.write(f"**Sauron:** A feeble mortal dares to challenge me? Hah! Answer this question, or be doomed to eternal failure!")
     st.write(f"🔹 {st.session_state.current_question}")
 
-    # User input
     answer = st.text_input("Your Answer:")
 
     if st.button("Submit Answer"):
-        if answer.lower().strip() == "hint":
-            st.info(f"💡 Hint: {st.session_state.hint}")
-        elif answer.strip():
-            response = validator.act(st.session_state.current_question, answer)
-            if response in ['yes', 'yes.']:
+        if answer.strip():
+            is_correct, correct_answer = validator.act(st.session_state.current_question, answer)
+
+            if is_correct:
                 st.success("✅ Correct! You defeated the enemy.")
                 st.session_state.points += POINTS_PER_CORRECT
                 st.session_state.questions_answered += 1
-                time.sleep(2)
+                time.sleep(1.5)
 
-                # Move to next level if necessary
                 if st.session_state.questions_answered >= QUESTIONS_PER_LEVEL:
-                    if st.session_state.level == MAX_LEVEL:
-                        st.success("🎉 Congratulations! You have won the game! 🎉")
-                        st.stop()
-                    else:
+                    if st.session_state.level < MAX_LEVEL:
                         st.session_state.level += 1
                         st.session_state.questions_answered = 0
                         st.success(f"🔺 Level Up! Welcome to Level {st.session_state.level}.")
 
-                generate_new_question()
+                st.session_state.current_question = None
                 st.rerun()
             else:
                 st.error("❌ Wrong answer! Try again.")
-                time.sleep(2)
                 st.session_state.lives -= 1
-                st.rerun()  # Force refresh to update lives in sidebar
+                st.session_state.last_correct_answer = correct_answer
+                time.sleep(1.5)
+                st.rerun()
 
 main()
