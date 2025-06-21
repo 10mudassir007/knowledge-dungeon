@@ -1,11 +1,12 @@
-from langchain_groq import ChatGroq, GroqEmbeddings
+from langchain_groq import ChatGroq
 import streamlit as st
 from crewai import Agent
 import os
 import time
 import re
 from difflib import SequenceMatcher
-from sklearn.pairwise import cosine_similarity
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 # Initialize LLM
 llm = ChatGroq(temperature=0, model_name="meta-llama/llama-4-maverick-17b-128e-instruct")
 
@@ -85,7 +86,7 @@ class AnswerCheckerAgent(Agent):
 class AnswerCheckerAgent(Agent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.embedder = GroqEmbeddings(model="nomic-embed-text-v1")
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
     def act(self, question, user_answer):
         correct = self.reveal_answer(question)
@@ -101,13 +102,11 @@ class AnswerCheckerAgent(Agent):
         user_clean = normalize(user_answer)
         correct_clean = normalize(correct_answer)
 
-        # Embed both
-        user_embedding = self.embedder.embed_query(user_clean)
-        correct_embedding = self.embedder.embed_query(correct_clean)
+        user_vec = self.embedder.encode(user_clean)
+        correct_vec = self.embedder.encode(correct_clean)
 
-        # Cosine similarity
-        sim = cosine_similarity([user_embedding], [correct_embedding])[0][0]
-        return sim >= 0.80  # 80% similarity threshold
+        sim = cosine_similarity([user_vec], [correct_vec])[0][0]
+        return sim >= 0.8  # Adjust t
 
 # Instantiate agents
 narrator = NarratorAgent(role="Narrator", goal="Guide the story forward", backstory="Knows all details of the world and its characters.")
